@@ -216,7 +216,6 @@ export default async function handler(req, res) {
   console.error("Event error:", e);
   const msg = "OpenAI内部エラー: " + (e?.message || e);
   try { await replyToLine(ev.replyToken, msg); } catch {}
-}
     }
   }
 
