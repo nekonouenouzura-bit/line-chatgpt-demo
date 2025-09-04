@@ -1,5 +1,8 @@
 {
   "name": "line-chatgpt-demo",
-  "version": "0.0.1",
-  "type": "module"
+  "version": "0.1.0",
+  "type": "module",
+  "dependencies": {
+    "papaparse": "^5.4.1"
+  }
 }
