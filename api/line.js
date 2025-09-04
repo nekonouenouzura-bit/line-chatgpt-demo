@@ -212,10 +212,11 @@ export default async function handler(req, res) {
       } else {
         await replyToLine(ev.replyToken, "テキストでご質問ください。");
       }
-   } catch (e) {
-  console.error("Event error:", e);
-  const msg = "OpenAI内部エラー: " + (e?.message || e);
-  try { await replyToLine(ev.replyToken, msg); } catch {}
+    } catch (e) {
+      log("Event error:", e?.message || e);
+      try {
+        await replyToLine(ev.replyToken, "只今混み合っています。少し時間をおいてお試しください。");
+      } catch {}
     }
   }
 
