@@ -1,118 +1,106 @@
 /**
  * api/line.js
- * LINE → (FAQヒットなら即答 / なければ OpenAI) → LINE
- * 依存: papaparse
+ * LINEボット: FAQ(Embeddings検索) → なければ OpenAI回答
  */
 
 import crypto from "crypto";
 import Papa from "papaparse";
 
-// ========= ユーティリティ =========
-
-// Webhookの生ボディ（文字列）を取得（署名検証に必須）
-async function readRawBody(req) {
-  return await new Promise((resolve, reject) => {
-    let data = "";
-    req.setEncoding("utf8");
-    req.on("data", (c) => (data += c));
-    req.on("end", () => resolve(data));
-    req.on("error", reject);
+// ======= Embeddings =======
+async function getEmbedding(text) {
+  const res = await fetch("https://api.openai.com/v1/embeddings", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: "text-embedding-3-small", // 安価＆十分な精度
+      input: text,
+    }),
   });
+
+  if (!res.ok) {
+    const t = await res.text().catch(() => "");
+    throw new Error("Embedding error: " + t);
+  }
+  const data = await res.json();
+  return data.data[0].embedding;
 }
 
-// 軽量ロガー
-function log(...args) {
-  console.log("[line-bot]", ...args);
+function cosineSim(vecA, vecB) {
+  let dot = 0,
+    normA = 0,
+    normB = 0;
+  for (let i = 0; i < vecA.length; i++) {
+    dot += vecA[i] * vecB[i];
+    normA += vecA[i] * vecA[i];
+    normB += vecB[i] * vecB[i];
+  }
+  return dot / (Math.sqrt(normA) * Math.sqrt(normB));
 }
 
-// ========= FAQ（GoogleシートCSV） =========
-
+// ======= FAQ with Embeddings =======
 let cachedFAQ = [];
 let lastFetchMs = 0;
-const FAQ_CACHE_MS = 10 * 60 * 1000; // 10分
 
-async function loadFAQ() {
+async function loadFAQwithEmbeddings() {
   const now = Date.now();
-  if (cachedFAQ.length && now - lastFetchMs < FAQ_CACHE_MS) return cachedFAQ;
+  if (cachedFAQ.length && now - lastFetchMs < 10 * 60 * 1000) return cachedFAQ;
 
   const url = process.env.FAQ_SHEET_URL;
   if (!url) {
-    log("WARN: FAQ_SHEET_URL が未設定。FAQなしで続行します。");
-    cachedFAQ = [];
-    lastFetchMs = now;
-    return cachedFAQ;
+    console.warn("FAQ_SHEET_URL が未設定");
+    return [];
   }
-
   const res = await fetch(url);
-  if (!res.ok) {
-    const t = await res.text().catch(() => "");
-    throw new Error(`FAQ fetch error: ${res.status} ${t}`);
-  }
+  if (!res.ok) throw new Error("FAQ fetch error: " + (await res.text()));
   const csv = await res.text();
-
-  // 1行目ヘッダ: question, answer, (tags任意)
   const parsed = Papa.parse(csv, { header: true, skipEmptyLines: true });
-  cachedFAQ = (parsed.data || [])
-    .map((row) => ({
-      q: (row.question ?? "").toString().trim(),
-      a: (row.answer ?? "").toString().trim(),
-      tags: (row.tags ?? "").toString().trim(),
-    }))
-    .filter((r) => r.q && r.a);
+
+  cachedFAQ = [];
+  for (const row of parsed.data) {
+    if (!row.question || !row.answer) continue;
+    try {
+      const emb = await getEmbedding(row.question);
+      cachedFAQ.push({
+        q: row.question.trim(),
+        a: row.answer.trim(),
+        emb,
+      });
+    } catch (e) {
+      console.error("Embedding生成失敗:", row.question, e.message);
+    }
+  }
 
   lastFetchMs = now;
-  log(`FAQ loaded: ${cachedFAQ.length} rows`);
+  console.log(`[FAQ] Embeddings生成済み: ${cachedFAQ.length}件`);
   return cachedFAQ;
 }
 
-// 文字正規化（ひらがな/カタカナ差や全半角をざっくり吸収）
-function normalize(s = "") {
-  const t = s
-    .toString()
-    .normalize("NFKC")
-    .toLowerCase()
-    .replace(/\s+/g, "");
-  // 句読点・記号などを軽く削る
-  return t.replace(/[、。・!！?？~〜－—_＿|｜/／\\（）\(\)\[\]【】「」『』"'`.,:：;；]/g, "");
-}
+async function matchFAQbyEmbedding(userText) {
+  const faqs = await loadFAQwithEmbeddings();
+  if (!faqs.length) return null;
 
-// とりあえずの簡易スコアリング（部分一致＋逆包含を評価）
-function simpleScore(qNorm, userNorm) {
-  if (!qNorm || !userNorm) return 0;
-  if (qNorm === userNorm) return 1;
-  if (userNorm.includes(qNorm)) return qNorm.length / Math.max(userNorm.length, 1);
-  if (qNorm.includes(userNorm)) return userNorm.length / Math.max(qNorm.length, 1);
-  // 共通部分の長さでざっくり
-  let common = 0;
-  const minLen = Math.min(qNorm.length, userNorm.length);
-  for (let i = 0; i < minLen; i++) {
-    if (qNorm[i] === userNorm[i]) common++;
-    else break;
-  }
-  return common / Math.max(minLen, 1) * 0.3; // 先頭一致に少しだけ点
-}
+  const userEmb = await getEmbedding(userText);
 
-// FAQ照合：しきい値を超える最高スコアの回答を返す
-async function matchFAQ(userText) {
-  const list = await loadFAQ();
-  const u = normalize(userText);
-  let best = { score: 0, answer: null, q: "" };
-
-  for (const row of list) {
-    const s = simpleScore(normalize(row.q), u);
-    if (s > best.score) best = { score: s, answer: row.a, q: row.q };
+  let best = { score: -1, answer: null, q: "" };
+  for (const f of faqs) {
+    const sim = cosineSim(userEmb, f.emb);
+    if (sim > best.score) {
+      best = { score: sim, answer: f.a, q: f.q };
+    }
   }
 
-  // しきい値は0.4あたり（調整可）
-  if (best.score >= 0.4) {
-    log(`FAQ HIT: "${best.q}" (score=${best.score.toFixed(2)})`);
+  // 類似度のしきい値（0.75〜0.8 推奨）
+  if (best.score >= 0.75) {
+    console.log(`FAQヒット: "${best.q}" (sim=${best.score.toFixed(2)})`);
     return best.answer;
   }
   return null;
 }
 
-// ========= OpenAI 呼び出し =========
-
+// ======= OpenAI Chat =======
 async function callOpenAI(userText) {
   const res = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
@@ -143,8 +131,7 @@ async function callOpenAI(userText) {
   return data.choices?.[0]?.message?.content ?? "すみません、うまく答えられませんでした。";
 }
 
-// ========= LINE 返信 =========
-
+// ======= LINE Reply =======
 async function replyToLine(replyToken, text) {
   const res = await fetch("https://api.line.me/v2/bot/message/reply", {
     method: "POST",
@@ -164,16 +151,23 @@ async function replyToLine(replyToken, text) {
   }
 }
 
-// ========= メインハンドラ =========
+// ======= LINE Handler =======
+async function readRawBody(req) {
+  return await new Promise((resolve, reject) => {
+    let data = "";
+    req.setEncoding("utf8");
+    req.on("data", (c) => (data += c));
+    req.on("end", () => resolve(data));
+    req.on("error", reject);
+  });
+}
 
 export default async function handler(req, res) {
-  // GET はヘルスチェック/検証用に 200 を返す
-  if (req.method !== "POST") {
-    return res.status(200).send("ok");
-  }
+  if (req.method !== "POST") return res.status(200).send("ok");
 
-  // 1) 生ボディ＆署名検証
   const rawBody = await readRawBody(req);
+
+  // 署名検証
   const signature = req.headers["x-line-signature"] || "";
   const expected = crypto
     .createHmac("sha256", process.env.LINE_CHANNEL_SECRET || "")
@@ -181,11 +175,10 @@ export default async function handler(req, res) {
     .digest("base64");
 
   if (expected !== signature) {
-    log("Signature mismatch");
+    console.error("Signature mismatch");
     return res.status(401).send("unauthorized");
   }
 
-  // 2) JSON へ
   let body;
   try {
     body = JSON.parse(rawBody);
@@ -199,21 +192,21 @@ export default async function handler(req, res) {
       if (ev.type === "message" && ev.message?.type === "text") {
         const userText = ev.message.text || "";
 
-        // (a) まずFAQ検索
-        const faqAnswer = await matchFAQ(userText);
+        // Embeddings検索
+        const faqAnswer = await matchFAQbyEmbedding(userText);
         if (faqAnswer) {
           await replyToLine(ev.replyToken, faqAnswer);
           continue;
         }
 
-        // (b) なければ OpenAI
+        // なければ OpenAI
         const ai = await callOpenAI(userText);
         await replyToLine(ev.replyToken, ai);
       } else {
         await replyToLine(ev.replyToken, "テキストでご質問ください。");
       }
     } catch (e) {
-      log("Event error:", e?.message || e);
+      console.error("Event error:", e);
       try {
         await replyToLine(ev.replyToken, "只今混み合っています。少し時間をおいてお試しください。");
       } catch {}
